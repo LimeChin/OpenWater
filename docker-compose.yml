@@ -1,0 +1,29 @@
+version: '3'
+services:
+  one-api:
+    image: justsong/one-api:latest
+    container_name: one-api
+    restart: always
+    ports:
+      - '3000:3000'
+    volumes:
+      - ./data:/data
+    environment:
+      - TZ=Asia/Shanghai
+      - XUNHUPAY_APPID=201906178077
+      - XUNHUPAY_APPSECRET=8615d7b38baf39db7ec75b6bae498e26
+      - XUNHUPAY_API_URL=https://api.xunhupay.com/payment/do.html
+
+  faka:
+    build:
+      context: .
+      dockerfile: Dockerfile_faka
+    container_name: faka
+    restart: always
+    ports:
+      - '3001:3001'
+    volumes:
+      - ./faka.db:/app/faka.db
+      - ./data/one-api.db:/data/one-api.db
+    depends_on:
+      - one-api
