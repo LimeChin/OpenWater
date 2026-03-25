@@ -1,222 +1,191 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-极简发卡程序 v3 - 直接操作 One-API 数据库
-支持虎皮椒支付回调，自动生成兑换码
-"""
-
-from flask import Flask, render_string, request, jsonify
-import requests
-import sqlite3
-import json
-import hashlib
+import os
 import time
-from datetime import datetime
+import sqlite3
+import hashlib
+import random
+import string
+from flask import Flask, request, redirect, render_template_string
 
 app = Flask(__name__)
 
-# 配置
+# 配置信息
 XUNHUPAY_APPID = "201906178077"
-XUNHUPAY_KEY = "8615d7b38baf39db7ec75b6bae498e26"
-XUNHUPAY_API = "https://api.xunhupay.com/payment/do.html"
-ONE_API_DB = "/opt/one-api/data/one-api.db"
+XUNHUPAY_APPSECRET = "8615d7b38baf39db7ec75b6bae498e26"
+XUNHUPAY_API_URL = "https://api.xunhupay.com/payment/do.html"
+ONE_API_DB_PATH = "/data/one-api.db"
 
-# 1 元 = 10,000 积分的映射
-QUOTA_PER_YUAN = 10000  # 实际存储为 50亿 额度单位
+# 定价逻辑：1元 = 10,000 积分
+POINTS_PER_YUAN = 10000
+QUOTA_PER_POINT = 1
+QUOTA_PER_YUAN = POINTS_PER_YUAN * QUOTA_PER_POINT
+
+def generate_signature(params, secret):
+    sorted_params = sorted(params.items())
+    query_string = "&".join([f"{k}={v}" for k, v in sorted_params if v])
+    return hashlib.md5((query_string + secret).encode('utf-8')).hexdigest()
+
+def generate_redemption_key():
+    return 'sk-' + ''.join(random.choices(string.ascii_letters + string.digits, k=32))
+
+def init_db():
+    conn = sqlite3.connect('faka.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS orders
+                 (trade_order_id TEXT PRIMARY KEY, amount REAL, quota INTEGER, code TEXT, status INTEGER)''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 @app.route('/')
 def index():
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>Water API - 积分充值</title>
-        <style>
-            body { font-family: Arial; text-align: center; padding: 50px; }
-            .container { max-width: 400px; margin: 0 auto; border: 1px solid #ddd; padding: 30px; border-radius: 8px; }
-            input { padding: 10px; margin: 10px 0; width: 100%; box-sizing: border-box; }
-            button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; width: 100%; }
-            button:hover { background: #0056b3; }
-            .price { font-size: 24px; color: #28a745; margin: 20px 0; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>💰 Water API 积分充值</h1>
-            <p>1 元 = 10,000 积分</p>
-            <form id="payForm">
-                <input type="number" id="amount" placeholder="充值金额（元）" min="0.01" step="0.01" required>
-                <div class="price">预计获得：<span id="quota">0</span> 积分</div>
-                <button type="submit">立即支付</button>
-            </form>
-        </div>
-        <script>
-            document.getElementById('amount').addEventListener('input', function() {
-                var amount = parseFloat(this.value) || 0;
-                document.getElementById('quota').textContent = (amount * 10000).toLocaleString();
-            });
-            document.getElementById('payForm').addEventListener('submit', function(e) {
-                e.preventDefault();
-                var amount = document.getElementById('amount').value;
-                window.location.href = '/pay?amount=' + amount;
-            });
-        </script>
-    </body>
-    </html>
-    """
-    return render_string(html)
-
-@app.route('/pay')
-def pay():
-    """生成虎皮椒支付链接"""
-    try:
-        amount = float(request.args.get('amount', 0))
-        if amount <= 0:
-            return "金额必须大于0", 400
-        
-        # 生成订单号
-        order_id = f"WaterAPI_{int(time.time() * 1000)}"
-        
-        # 构建支付参数
-        params = {
-            'pid': XUNHUPAY_APPID,
-            'type': 'wxpay',  # 微信支付
-            'out_trade_no': order_id,
-            'notify_url': 'http://144.202.121.4:3001/callback',
-            'return_url': 'http://144.202.121.4:3001/success',
-            'name': f'Water API - {int(amount * 10000)} 积分',
-            'money': str(amount),
-        }
-        
-        # 生成签名
-        sign_str = f"{XUNHUPAY_APPID}{order_id}{amount}{XUNHUPAY_KEY}"
-        params['sign'] = hashlib.md5(sign_str.encode()).hexdigest()
-        
-        # 重定向到虎皮椒
-        redirect_url = f"{XUNHUPAY_API}?" + "&".join([f"{k}={v}" for k, v in params.items()])
-        
-        return f"""
-        <html>
-        <body>
-            <p>正在跳转到支付页面...</p>
-            <script>
-                window.location.href = '{redirect_url}';
-            </script>
-        </body>
-        </html>
-        """
-    except Exception as e:
-        return f"错误: {str(e)}", 500
-
-@app.route('/callback', methods=['POST'])
-def callback():
-    """虎皮椒支付回调"""
-    try:
-        # 获取回调参数
-        out_trade_no = request.form.get('out_trade_no')
-        trade_no = request.form.get('trade_no')
-        money = float(request.form.get('money', 0))
-        sign = request.form.get('sign')
-        
-        # 验证签名
-        sign_str = f"{XUNHUPAY_APPID}{out_trade_no}{money}{XUNHUPAY_KEY}"
-        expected_sign = hashlib.md5(sign_str.encode()).hexdigest()
-        
-        if sign != expected_sign:
-            return "签名验证失败", 403
-        
-        # 计算积分
-        quota = int(money * QUOTA_PER_YUAN)
-        
-        # 生成兑换码
-        redemption_code = generate_redemption_code(quota)
-        
-        return "success"
-    except Exception as e:
-        print(f"回调错误: {str(e)}")
-        return "error", 500
-
-@app.route('/success')
-def success():
-    """支付成功页面"""
-    try:
-        out_trade_no = request.args.get('out_trade_no')
-        money = float(request.args.get('money', 0))
-        
-        # 从数据库查询兑换码
-        conn = sqlite3.connect(ONE_API_DB)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT code FROM redemptions WHERE key LIKE ? ORDER BY id DESC LIMIT 1",
-            (f"%{out_trade_no}%",)
-        )
-        result = cursor.fetchone()
-        conn.close()
-        
-        redemption_code = result[0] if result else "生成中..."
-        quota = int(money * 10000)
-        
-        html = f"""
+    return render_template_string('''
         <!DOCTYPE html>
         <html>
         <head>
-            <meta charset="utf-8">
-            <title>支付成功</title>
+            <title>Water API 充值中心</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
-                body {{ font-family: Arial; text-align: center; padding: 50px; background: #f0f0f0; }}
-                .container {{ max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-                .success {{ color: #28a745; font-size: 48px; margin: 20px 0; }}
-                .code {{ background: #f9f9f9; padding: 20px; margin: 20px 0; border-radius: 4px; font-family: monospace; word-break: break-all; }}
-                button {{ padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }}
+                body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f0f2f5; }
+                .card { background: white; padding: 2.5rem; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); width: 100%; max-width: 400px; text-align: center; }
+                h2 { color: #1a1a1a; margin-bottom: 1.5rem; }
+                input { width: 100%; padding: 12px; margin: 1rem 0; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 16px; }
+                button { width: 100%; padding: 12px; background: #07c160; color: white; border: none; border-radius: 6px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+                button:hover { background: #06ae56; }
+                .info { margin-top: 1.5rem; color: #666; font-size: 14px; line-height: 1.6; }
+                .highlight { color: #07c160; font-weight: bold; }
             </style>
         </head>
         <body>
-            <div class="container">
-                <div class="success">✓ 支付成功！</div>
-                <p>您已充值 ¥{money:.2f}</p>
-                <p style="font-size: 24px; color: #28a745;">获得 {quota:,} 积分</p>
-                <p style="margin-top: 30px; color: #666;">您的兑换码：</p>
-                <div class="code">{redemption_code}</div>
-                <button onclick="copyCode()">复制兑换码</button>
-                <p style="margin-top: 20px; color: #999; font-size: 12px;">请妥善保管兑换码，在 One-API 充值页面粘贴使用</p>
+            <div class="card">
+                <h2>Water API 充值</h2>
+                <form action="/pay" method="post">
+                    <input type="number" name="amount" placeholder="输入充值金额 (元)" min="1" step="1" required>
+                    <button type="submit">微信支付</button>
+                </form>
+                <div class="info">
+                    当前定价：<span class="highlight">1 元 = 10,000 积分</span><br>
+                    支付成功后将自动生成兑换码
+                </div>
             </div>
-            <script>
-                function copyCode() {{
-                    var code = '{redemption_code}';
-                    navigator.clipboard.writeText(code).then(function() {{
-                        alert('兑换码已复制到剪贴板');
-                    }});
-                }}
-            </script>
         </body>
         </html>
-        """
-        return html
-    except Exception as e:
-        return f"错误: {str(e)}", 500
+    ''')
 
-def generate_redemption_code(quota):
-    """在 One-API 数据库中生成兑换码"""
+@app.route('/pay', methods=['POST'])
+def pay():
+    amount = request.form.get('amount')
+    trade_order_id = str(int(time.time() * 1000))
+
+    params = {
+        "version": "1.1",
+        "appid": XUNHUPAY_APPID,
+        "trade_order_id": trade_order_id,
+        "total_fee": amount,
+        "title": f"Water API 充值 {amount}元",
+        "time": str(int(time.time())),
+        "notify_url": f"http://{request.host}/callback",
+        "return_url": f"http://{request.host}/result?trade_order_id={trade_order_id}",
+        "nonce_str": trade_order_id
+    }
+    params["hash"] = generate_signature(params, XUNHUPAY_APPSECRET)
+
     try:
-        conn = sqlite3.connect(ONE_API_DB)
-        cursor = conn.cursor()
-        
-        # 生成唯一的兑换码
-        code = f"sk-{hashlib.md5(f'{time.time()}{quota}'.encode()).hexdigest()[:32]}"
-        
-        # 插入到 redemptions 表
-        cursor.execute(
-            "INSERT INTO redemptions (code, quota, created_time, status) VALUES (?, ?, ?, ?)",
-            (code, quota, int(time.time()), 0)
-        )
-        conn.commit()
-        conn.close()
-        
-        return code
+        import requests
+        response = requests.post(XUNHUPAY_API_URL, data=params)
+        res_data = response.json()
+        if res_data.get("errcode") == 0:
+            conn = sqlite3.connect('faka.db')
+            c = conn.cursor()
+            c.execute("INSERT INTO orders VALUES (?, ?, ?, ?, ?)",
+                      (trade_order_id, float(amount), int(float(amount) * QUOTA_PER_YUAN), "", 0))
+            conn.commit()
+            conn.close()
+            return redirect(res_data.get("url"))
+        else:
+            return f"支付发起失败: {res_data.get('errmsg')}"
     except Exception as e:
-        print(f"生成兑换码错误: {str(e)}")
-        return "生成失败"
+        return f"系统错误: {str(e)}"
+
+@app.route('/callback', methods=['POST'])
+def callback():
+    data = request.form.to_dict()
+    signature = data.pop('hash', None)
+    if generate_signature(data, XUNHUPAY_APPSECRET) == signature:
+        if data.get('status') == 'OD':
+            trade_order_id = data.get('trade_order_id')
+            conn = sqlite3.connect('faka.db')
+            c = conn.cursor()
+            c.execute("SELECT quota, status FROM orders WHERE trade_order_id=?", (trade_order_id,))
+            order = c.fetchone()
+
+            if order and order[1] == 0:
+                quota = order[0]
+                try:
+                    one_api_conn = sqlite3.connect(ONE_API_DB_PATH)
+                    one_api_c = one_api_conn.cursor()
+                    key = generate_redemption_key()
+                    now = int(time.time())
+                    one_api_c.execute("INSERT INTO redemptions (user_id, key, status, name, quota, created_time) VALUES (?, ?, ?, ?, ?, ?)",
+                                      (1, key, 1, f"Order_{trade_order_id}", quota, now))
+                    one_api_conn.commit()
+                    one_api_conn.close()
+
+                    c.execute("UPDATE orders SET code=?, status=1 WHERE trade_order_id=?", (key, trade_order_id))
+                    conn.commit()
+                except Exception as e:
+                    print(f"Database error: {e}")
+            conn.close()
+            return "success"
+    return "fail"
+
+@app.route('/result')
+def result():
+    trade_order_id = request.args.get('trade_order_id')
+    conn = sqlite3.connect('faka.db')
+    c = conn.cursor()
+    c.execute("SELECT code, status FROM orders WHERE trade_order_id=?", (trade_order_id,))
+    order = c.fetchone()
+    conn.close()
+
+    if order:
+        if order[1] == 1:
+            return render_template_string('''
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>充值成功</title>
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <style>
+                        body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f4f7f6; }
+                        .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); width: 100%; max-width: 400px; text-align: center; }
+                        .code { background: #eee; padding: 15px; font-family: monospace; font-size: 18px; margin: 20px 0; word-break: break-all; border: 1px dashed #ccc; }
+                        button { padding: 12px 24px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+                        .info { background: #f8f9fa; padding: 15px; border-radius: 6px; margin: 15px 0; text-align: left; font-size: 14px; }
+                        .info code { background: #e9ecef; padding: 2px 6px; border-radius: 4px; }
+                    </style>
+                </head>
+                <body>
+                    <div class="card">
+                        <h2 style="color: #07c160;">支付成功！</h2>
+                        <p>您的兑换码为：</p>
+                        <div class="code">{{ code }}</div>
+                        <div class="info">
+                            <strong>使用方法：</strong><br>
+                            1. 访问 <a href="http://144.202.121.4:3000" target="_blank">One-API</a> 登录<br>
+                            2. 在充值页面粘贴兑换码<br>
+                            3. 获得积分后创建令牌使用 API<br><br>
+                            <strong>API 地址：</strong><br>
+                            <code>http://144.202.121.4:3000/v1</code>
+                        </div>
+                        <button onclick="window.location.href='http://144.202.121.4:3000/topup'">前往充值页面</button>
+                    </div>
+                </body>
+                </html>
+            ''', code=order[0])
+        else:
+            return "支付处理中，请稍后刷新页面..."
+    return "订单不存在"
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=3001, debug=False)
+    app.run(host='0.0.0.0', port=3001)
